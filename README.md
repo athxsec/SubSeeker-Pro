@@ -71,16 +71,20 @@ You can run the tool in two ways:
 For a user-friendly experience, just run the script with no arguments.
 
 ```bash
-python3 subseeker_pro.py 
+python3 subseeker_pro.py
+```
 
-**Command-Line Mode (Advanced)**
-usage: subseeker_pro.py [-h] -d DOMAIN [-w WORDLIST] [-t THREADS] [-o OUTPUT]
+###Command-Line Mode (Advanced)
+***usage: 
+```
+ subseeker_pro.py [-h] -d DOMAIN [-w WORDLIST] [-t THREADS] [-o OUTPUT]
                         [-r] [--no-passive] [--no-active] [--no-wildcard]
                         [-c CONCURRENCY]
-
+```
 SubSeeker-Pro 1.6.0 by athxsec - A powerful asyncio-based subdomain finder.
 
-options:
+options: 
+```
   -h, --help            show this help message and exit
   -d DOMAIN, --domain DOMAIN
                         The target domain (e.g., google.com)
@@ -98,22 +102,23 @@ options:
   --no-wildcard         Skip the wildcard detection
   -c CONCURRENCY, --concurrency CONCURRENCY
                         Number of concurrent passive scans (default: 2)
-
-                        Examples:
+```
+                      
+Examples:
 
 Passive scan only:
 
-Bash
+```Bash
 python3 subseeker_pro.py -d example.com
 Passive scan + Resolve (Show only LIVE subdomains):
-
-Bash
+```
+```Bash
 python3 subseeker_pro.py -d example.com --resolve
 Full Scan (Passive + Active) and Save LIVE results:
-
-Bash
+```
+```Bash
 python3 subseeker_pro.py -d example.com -w wordlist.txt -r -o robu_live_subs.txt
-
+```
 
 Dance Mode
 dance mode in 1
