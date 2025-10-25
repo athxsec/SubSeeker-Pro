@@ -71,7 +71,9 @@ For a user-friendly experience, just run the script with no arguments. It will g
 
 ```bash
 python3 subseeker_pro.py
+```
   </pre>
+
   <p align="center">
     <b>Version 1.7.1</b> by <b>athxsec</b>
   </p>
@@ -131,4 +133,5 @@ python3 subseeker_pro.py
 For a user-friendly experience, just run the script with no arguments. It will guide you through all the options.
 
 ```bash
+
 python3 subseeker_pro.py
