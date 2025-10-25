@@ -2,11 +2,14 @@
 #
 # Tool:     SubSeeker-Pro
 # Author:   athxsec
-# Version:  1.7.0 (Feature Pack Edition)
+# Version:  1.7.1 (Wayback Fix Edition)
 #
 # A high-speed, asyncio-based subdomain enumeration tool
 # with interactive and command-line modes. Includes probing, CNAME checks,
 # Wayback URLs, IP info, and JSON output. All open-source.
+#
+# NEW in 1.7.1:
+# - Fixed "Session is closed" error for Wayback Machine queries.
 #
 
 import argparse
@@ -25,25 +28,21 @@ from rich.table import Table
 
 # --- Metadata ---
 __author__ = "athxsec"
-__version__ = "1.7.0"
+__version__ = "1.7.1" # Incremented version
 
 # Initialize rich console
 console = Console()
 
 # --- Global Data Structures ---
-# Store comprehensive results: {subdomain: {"ips": [], "cnames": [], "http_urls": [], "title": "", "wayback": []}}
 results_data = {}
 
 # --- Configuration ---
 RESOLVERS = ['1.1.1.1', '1.0.0.1', '8.8.8.8', '8.8.4.4']
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36 SubSeekerPro"
 SESSION_TIMEOUT = aiohttp.ClientTimeout(total=25)
-# Reduce passive concurrency slightly for stability
 DEFAULT_PASSIVE_CONCURRENCY = 2
 DEFAULT_RESOLVE_THREADS = 100
 DEFAULT_PROBE_CONCURRENCY = 50
-
-# Regex to extract titles from HTML
 TITLE_REGEX = re.compile(r'<title.*?>(.*?)</title>', re.IGNORECASE | re.DOTALL)
 
 # --- Utility Functions ---
@@ -56,7 +55,8 @@ def is_valid_domain(value):
 
 def print_result(subdomain, data, args):
     """ Prints a single result line based on collected data """
-    if not args.resolve and not args.probe: # Simple passive/active find
+    # Don't print detailed lines if only doing basic discovery
+    if not args.resolve and not args.probe and not args.cname and not args.wayback:
         console.print(f"[+] Found: [bold green]{subdomain}[/]", highlight=False)
         return
 
@@ -70,7 +70,6 @@ def print_result(subdomain, data, args):
         urls_str = ', '.join(f"[link={url}]{url}[/link]" for url in data['http_urls'])
         details.append(f"Web: {urls_str}")
         if data.get("title"):
-             # Truncate long titles
             title = data['title'].strip()
             title = title[:60] + '...' if len(title) > 63 else title
             details.append(f"Title: [dim italic]'{title}'[/]")
@@ -81,36 +80,29 @@ def print_result(subdomain, data, args):
         output += f" ({'; '.join(details)})"
     console.print(output, highlight=False)
 
-
 # --- Wildcard DNS Detection (Created by athxsec) ---
 
 async def check_wildcard(domain: str) -> bool:
-    """
-    Detect wildcard DNS by resolving a random subdomain under the target.
-    Returns True if wildcard DNS seems active.
-    """
-    test_sub = f"{random.randint(10000,99999)}.{domain}"
+    """ Detect wildcard DNS """
+    console.print(f"[*] Checking for wildcard DNS on [bold cyan]{domain}[/]...", style="yellow")
+    test_sub = f"{random.randint(10000,99999)}-subseeker-test.{domain}" # More unique name
     resolver = aiodns.DNSResolver()
     resolver.nameservers = RESOLVERS
     try:
         await resolver.query(test_sub, 'A')
-        console.print(f"[yellow][!] Wildcard DNS detected on {domain}. Results may include false positives.[/]")
+        console.print(f"[!] [bold red]Wildcard DNS detected on {domain}. Results may include false positives.[/]", style="red")
         return True
     except aiodns.error.DNSError:
         console.print(f"[*] No wildcard DNS detected for {domain}.", style="dim")
         return False
     except Exception as e:
         console.print(f"[-] Wildcard check error for {domain}: {e}", style="dim")
-        return False
-
+        return False # Assume no wildcard if check fails
 
 # --- DNS Resolution & CNAME Engine (Modified by athxsec) ---
 
 async def resolve_worker(domain_queue: asyncio.Queue, resolver: aiodns.DNSResolver, check_cname: bool):
-    """
-    Worker task for resolving A and optionally CNAME records.
-    Updates the global results_data dictionary.
-    """
+    """ Worker task for resolving A and optionally CNAME records. """
     while True:
         try:
             domain = await domain_queue.get()
@@ -119,61 +111,41 @@ async def resolve_worker(domain_queue: asyncio.Queue, resolver: aiodns.DNSResolv
             is_live = False
 
             try:
-                # Resolve A records (IP addresses)
                 a_records = await resolver.query(domain, 'A')
                 ips.update(record.host for record in a_records)
                 is_live = True
-            except (aiodns.error.DNSError, asyncio.TimeoutError):
-                pass # No A record found or timeout
+            except (aiodns.error.DNSError, asyncio.TimeoutError): pass
 
             if check_cname:
                 try:
-                    # Resolve CNAME records
                     cname_records = await resolver.query(domain, 'CNAME')
                     cnames.update(record.cname for record in cname_records)
-                    # If CNAME exists, we consider it potentially 'live' even without A record yet
-                    is_live = True
-                except (aiodns.error.DNSError, asyncio.TimeoutError):
-                     pass # No CNAME record found
+                    is_live = True # Consider live if CNAME exists
+                except (aiodns.error.DNSError, asyncio.TimeoutError): pass
 
             if is_live:
-                 # Update global results dictionary
-                if domain not in results_data:
-                    results_data[domain] = {}
+                if domain not in results_data: results_data[domain] = {}
                 results_data[domain]["ips"] = sorted(list(ips))
                 results_data[domain]["cnames"] = sorted(list(cnames))
 
             domain_queue.task_done()
-        except asyncio.CancelledError:
-            break
+        except asyncio.CancelledError: break
         except Exception as e:
             console.print(f"[-] Resolver error for {domain}: {e}", style="dim")
-            domain_queue.task_done() # Ensure task is marked done even on error
-
+            domain_queue.task_done()
 
 async def run_resolver_engine(domains_to_check: set, num_threads: int, check_cname: bool):
-    """
-    High-speed DNS resolver for validating subdomains and getting CNAMEs.
-    """
+    """ High-speed DNS resolver """
     domain_queue = asyncio.Queue()
-    for domain in domains_to_check:
-        domain_queue.put_nowait(domain)
-
-    if domain_queue.empty():
-        return
+    for domain in domains_to_check: domain_queue.put_nowait(domain)
+    if domain_queue.empty(): return
 
     resolver = aiodns.DNSResolver()
     resolver.nameservers = RESOLVERS
-
-    workers = [
-        asyncio.create_task(resolve_worker(domain_queue, resolver, check_cname))
-        for _ in range(num_threads)
-    ]
+    workers = [asyncio.create_task(resolve_worker(domain_queue, resolver, check_cname)) for _ in range(num_threads)]
     await domain_queue.join()
-    for worker in workers:
-        worker.cancel()
+    for worker in workers: worker.cancel()
     await asyncio.gather(*workers, return_exceptions=True)
-
 
 # --- HTTP/HTTPS Probing Engine (Created by athxsec) ---
 
@@ -184,106 +156,71 @@ async def probe_worker(domain_queue: asyncio.Queue, session: aiohttp.ClientSessi
             domain = await domain_queue.get()
             found_urls = []
             title = ""
-
             for scheme in ["https", "http"]:
                 url = f"{scheme}://{domain}"
                 try:
-                    # Use HEAD request for speed, follow redirects
                     async with session.head(url, timeout=SESSION_TIMEOUT, allow_redirects=True) as response:
-                        # Consider any successful status code (2xx, 3xx) as live
                         if 200 <= response.status < 400:
-                            found_urls.append(str(response.url)) # Store final URL after redirects
-
-                            # If it's HTTPS and we haven't found a title, try GET
-                            if scheme == "https" and not title:
+                            final_url = str(response.url)
+                            found_urls.append(final_url)
+                            if scheme == "https" and not title and final_url.startswith("https"): # Prioritize title from final https URL
                                 try:
-                                    async with session.get(url, timeout=SESSION_TIMEOUT) as get_response:
+                                    async with session.get(final_url, timeout=SESSION_TIMEOUT) as get_response:
                                         if 200 <= get_response.status < 300:
-                                             # Read only the first few KB to find the title
-                                            html_chunk = await get_response.content.read(1024 * 16) # Read 16KB
-                                            match = TITLE_REGEX.search(html_chunk.decode('utf-8', errors='ignore'))
-                                            if match:
-                                                title = match.group(1).strip().replace('\n', ' ').replace('\r', '')
-                                except Exception:
-                                    pass # Ignore GET errors if HEAD worked
-                except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-                    pass # Connection errors, SSL errors, timeouts etc.
-                except Exception as e:
-                    console.print(f"[-] Probe error for {url}: {e}", style="dim")
+                                            html_chunk = await get_response.content.read(1024 * 32) # Read 32KB
+                                            match = TITLE_REGEX.search(html_chunk.decode(get_response.charset or 'utf-8', errors='ignore'))
+                                            if match: title = match.group(1).strip().replace('\n', ' ').replace('\r', '')
+                                except Exception: pass # Ignore GET errors
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError): pass
+                except Exception as e: console.print(f"[-] Probe error for {url}: {e}", style="dim")
 
-            # Update global results dictionary if web server found
             if found_urls:
-                 if domain not in results_data: results_data[domain] = {}
-                 results_data[domain]["http_urls"] = sorted(list(set(found_urls))) # Use set to remove duplicates from redirects
-                 results_data[domain]["title"] = title
-
+                if domain not in results_data: results_data[domain] = {}
+                results_data[domain]["http_urls"] = sorted(list(set(found_urls)))
+                results_data[domain]["title"] = title
             domain_queue.task_done()
-        except asyncio.CancelledError:
-            break
-        except Exception:
-             domain_queue.task_done() # Ensure task is marked done
-
+        except asyncio.CancelledError: break
+        except Exception: domain_queue.task_done()
 
 async def run_probing_engine(domains_to_probe: set, num_threads: int):
     """ Runs the HTTP/HTTPS probing """
     domain_queue = asyncio.Queue()
-    for domain in domains_to_probe:
-        domain_queue.put_nowait(domain)
+    for domain in domains_to_probe: domain_queue.put_nowait(domain)
+    if domain_queue.empty(): return
 
-    if domain_queue.empty():
-        return
-
-    # Use specified resolvers for probing connections too
     resolver = aiohttp.AsyncResolver(nameservers=RESOLVERS)
-    connector = aiohttp.TCPConnector(resolver=resolver, ssl=False, limit_per_host=num_threads) # Ignore SSL errors for probing
-
+    connector = aiohttp.TCPConnector(resolver=resolver, ssl=False, limit_per_host=num_threads)
     headers = {'User-Agent': USER_AGENT}
     async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
-        workers = [
-            asyncio.create_task(probe_worker(domain_queue, session))
-            for _ in range(num_threads)
-        ]
+        workers = [asyncio.create_task(probe_worker(domain_queue, session)) for _ in range(num_threads)]
         await domain_queue.join()
-        for worker in workers:
-            worker.cancel()
+        for worker in workers: worker.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
-
 
 # --- Wayback Machine Engine (Created by athxsec) ---
 
 async def source_wayback(domain: str, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore):
-    """
-    Get historical URLs from the Wayback Machine CDX API.
-    """
+    """ Get historical URLs from the Wayback Machine """
     async with semaphore:
-        console.print(f"[*] Querying Wayback Machine for {domain}...", style="dim")
+        # console.print(f"[*] Querying Wayback Machine for {domain}...", style="dim") # Can be noisy
         wayback_urls = set()
         try:
-            # Use wildcard query for the domain
             url = f"https://web.archive.org/cdx/search/cdx?url={domain}/*&output=json&fl=original&collapse=urlkey&limit=1000"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response: # Longer timeout for wayback
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
                 if response.status == 200:
                     try:
                         data = await response.json()
-                        # The first item is the header, skip it
-                        for item in data[1:]:
-                            wayback_urls.add(item[0])
-                    except (json.JSONDecodeError, aiohttp.ContentTypeError):
-                        # Sometimes Wayback returns non-json on error/no results
-                        pass
-                else:
-                    console.print(f"[-] Wayback error for {domain}: Status {response.status}", style="red")
+                        if len(data) > 1: # Check if there are actual results beyond the header
+                             wayback_urls.update(item[0] for item in data[1:])
+                    except (json.JSONDecodeError, aiohttp.ContentTypeError): pass
+                # Don't print errors for Wayback, it's often noisy/flaky
+                # else: console.print(f"[-] Wayback error for {domain}: Status {response.status}", style="red")
 
-            # Update global results
             if wayback_urls:
                 if domain not in results_data: results_data[domain] = {}
                 results_data[domain]["wayback"] = sorted(list(wayback_urls))
-
-        except asyncio.TimeoutError:
-             console.print(f"[-] Wayback error for {domain}: Connection timed out", style="red")
-        except Exception as e:
-            console.print(f"[-] Wayback error for {domain}: {e}", style="dim")
-
+        except asyncio.TimeoutError: pass # Ignore timeouts for Wayback
+        except Exception as e: console.print(f"[-] Wayback error for {domain}: {e}", style="dim") # Print other errors
 
 # --- Passive Sources (Modified by athxsec) ---
 
@@ -303,13 +240,13 @@ async def source_crtsh(domain: str, session: aiohttp.ClientSession, semaphore: a
                                 subs = name_value.split('\n')
                                 for sub in subs:
                                     sub_clean = sub.strip().lower()
-                                    if sub_clean.endswith(f".{domain}") and '*' not in sub_clean:
+                                    # Ensure it's a subdomain and not the base domain itself
+                                    if sub_clean.endswith(f".{domain}") and sub_clean != domain and '*' not in sub_clean:
                                         found_passive_subs.add(sub_clean)
-                    except aiohttp.ContentTypeError: pass # Ignore non-JSON
+                    except aiohttp.ContentTypeError: pass
                 else: console.print(f"[-] crt.sh error: Status {response.status}", style="red")
         except asyncio.TimeoutError: console.print(f"[-] crt.sh error: Timeout", style="red")
         except Exception as e: console.print(f"[-] crt.sh error: {e}", style="dim")
-
 
 async def source_alienvault(domain: str, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, found_passive_subs: set):
     """ Get subdomains from AlienVault OTX """
@@ -322,12 +259,12 @@ async def source_alienvault(domain: str, session: aiohttp.ClientSession, semapho
                     data = await response.json()
                     for record in data.get('passive_dns', []):
                         hostname = record.get('hostname', '').strip().lower()
-                        if hostname.endswith(f".{domain}") and '*' not in hostname:
+                        if hostname.endswith(f".{domain}") and hostname != domain and '*' not in hostname:
                             found_passive_subs.add(hostname)
-                else: console.print(f"[-] AlienVault error: Status {response.status}", style="red")
+                # Don't print 429 rate limit errors, they are expected
+                elif response.status != 429: console.print(f"[-] AlienVault error: Status {response.status}", style="red")
         except asyncio.TimeoutError: console.print(f"[-] AlienVault error: Timeout", style="red")
         except Exception as e: console.print(f"[-] AlienVault error: {e}", style="dim")
-
 
 # --- Active Brute-force (Modified by athxsec) ---
 
@@ -340,14 +277,15 @@ async def active_scan(domain: str, wordlist_file: str, num_threads: int, found_a
             for line in f:
                 word = line.strip()
                 if word: domains_to_check.add(f"{word}.{domain}")
-    except FileNotFoundError:
-        console.print(f"[-] Wordlist not found: {wordlist_file}", style="red"); return
-    if not domains_to_check:
-        console.print("[-] Wordlist is empty.", style="red"); return
+    except FileNotFoundError: console.print(f"[-] Wordlist not found: {wordlist_file}", style="red"); return
+    if not domains_to_check: console.print("[-] Wordlist is empty.", style="red"); return
 
     console.print(f"[*] Loaded {len(domains_to_check)} candidates for active scan.", style="yellow")
     # Run resolver, save directly to the provided set (found_active_subs)
-    await run_resolver_engine(domains_to_check, num_threads, found_active_subs, check_cname=False) # No CNAME check needed here
+    # Use check_cname=False because we only care if it resolves for brute-force confirmation
+    await run_resolver_engine(domains_to_check, num_threads, check_cname=False)
+    # Add resolved domains to the output set
+    found_active_subs.update(results_data.keys() & domains_to_check)
 
 
 # --- Argument Parsing & Interactive Mode ---
@@ -374,21 +312,19 @@ def get_cli_args():
     parser.add_argument("--probe-concurrency", type=int, default=DEFAULT_PROBE_CONCURRENCY, help=f"Concurrent HTTP probes (default: {DEFAULT_PROBE_CONCURRENCY})")
     return parser.parse_args()
 
-
 def print_banners():
     """ Prints the main ASCII art banners """
     console.print(r"""
-      █████████              █████        █████████                        █████                                       ███████████           
-     ███░░░░░███             ░░███        ███░░░░░███                      ░░███                                      ░░███░░░░░███          
-    ░███     ░░░  █████ ████  ░███████   ░███     ░░░    ██████    ██████   ░███ █████  ██████     ████████            ░███    ░███  ████████   ██████ 
-    ░░█████████  ░░███ ░███   ░███░░███   ░░█████████   ███░░███  ███░░███  ░███░░███  ███░░███░░  ███░░███ ██████████ ░██████████  ░░███░░███ ███░░███
-     ░░░░░░░░███  ░███ ░███   ░███ ░███   ░░░░░░░░███  ░███████  ░███████   ░██████░   ░███████   ░███ ░░░ ░░░░░░░░░░  ░███░░░░░░    ░███ ░░░ ░███ ░███
-   ███     ░███   ░███ ░███   ░███ ░███   ███     ░███ ░███░░░   ░███░░░    ░███░░███  ░███░░░    ░███                 ░███          ░███     ░███ ░███
-   ░░█████████   ░░████████    ████████   ░░█████████  ░░██████  ░░██████   ████ █████ ░░██████   █████                █████         █████    ░░██████ 
-     ░░░░░░░░░    ░░░░░░░░     ░░░░░░░░     ░░░░░░░░░    ░░░░░░    ░░░░░░   ░░░░  ░░░░░  ░░░░░░   ░░░░░                ░░░░░         ░░░░░      ░░░░░░  
+      █████████               █████       █████████                      █████                                        ███████████           
+     ███░░░░░███              ░░███       ███░░░░░███                    ░░███                                       ░░███░░░░░███          
+    ░███     ░░░  █████  ████  ░███████ ░███     ░░░    ██████    ██████  ░███ █████  ██████     ████████             ░███    ░███   ████████   ██████ 
+    ░░█████████  ░░███  ░███   ░███░░███ ░░█████████   ███░░███ ███░░███  ░███░░███  ███░░███░  ░███░░███  ██████████ ░██████████   ░░███░░███ ███░░███
+     ░░░░░░░░███  ░███  ░███   ░███ ░███  ░░░░░░░░███ ░███████ ░███████   ░██████░   ░███████   ░███  ░░░  ░░░░░░░░░░  ░███░░░░░░    ░███ ░░░ ░███ ░███
+    ███     ░███  ░███  ░███   ░███ ░███  ███     ░███ ░███░░░  ░███░░░  ░███░░███  ░███░░░     ░███                   ░███          ░███     ░███ ░███
+    ░░█████████   ░░████████    ████████  ░░█████████  ░░██████ ░░██████ ████  █████ ░░██████  █████                  █████         █████     ░░██████ 
+     ░░░░░░░░░     ░░░░░░░░     ░░░░░░░░    ░░░░░░░░░    ░░░░░░   ░░░░░ ░░░░   ░░░░░   ░░░░░░  ░░░░░                  ░░░░░         ░░░░░      ░░░░░░  
     """, style="bold cyan")
     console.print(f"[white]Version {__version__} by [bold magenta]{__author__}[/]\n")
-
 
 def get_interactive_args():
     """ Run an interactive menu to get arguments from the user """
@@ -398,11 +334,8 @@ def get_interactive_args():
 
     while True:
         domain = console.input("[bold yellow]?[/] [white]Enter target domain (e.g., example.com):[/] ")
-        try:
-            args.domain = is_valid_domain(domain)
-            break
-        except argparse.ArgumentTypeError as e:
-            console.print(f"[red]{e}[/]")
+        try: args.domain = is_valid_domain(domain); break
+        except argparse.ArgumentTypeError as e: console.print(f"[red]{e}[/]")
 
     console.print("\n--- [bold]Scan Options[/] ---")
     passive_input = console.input("[bold yellow]?[/] [white]Run passive scan? (y/n) [default: y]:[/] ")
@@ -425,7 +358,6 @@ def get_interactive_args():
     wayback_input = console.input("[bold yellow]?[/] [white]Query Wayback Machine? (y/n) [default: n]:[/] ")
     args.wayback = True if wayback_input.lower() == 'y' else False
 
-
     console.print("\n--- [bold]Concurrency & Output[/] ---")
     if not args.no_passive:
         concurrency = console.input(f"[bold yellow]?[/] [white]Passive scan concurrency [default: {DEFAULT_PASSIVE_CONCURRENCY}]:[/] ")
@@ -445,40 +377,35 @@ def get_interactive_args():
         except ValueError: console.print(f"[yellow]Invalid number, using {DEFAULT_PROBE_CONCURRENCY}.[/]"); args.probe_concurrency = DEFAULT_PROBE_CONCURRENCY
     else: args.probe_concurrency = DEFAULT_PROBE_CONCURRENCY
 
-
     output = console.input("[bold yellow]?[/] [white]Output file (or Enter to print to screen):[/] ")
     args.output = output if output else None
-
     if args.output:
         format_input = console.input("[bold yellow]?[/] [white]Output format (txt/json) [default: txt]:[/] ")
         args.output_format = format_input.lower() if format_input.lower() in ['txt', 'json'] else 'txt'
-    else:
-        args.output_format = 'txt'
+    else: args.output_format = 'txt'
 
-    args.no_wildcard = False # Always check wildcard in interactive
-
+    args.no_wildcard = False
     console.print("\n[green]Configuration set. Starting scan...[/]\n")
     return args
-
 
 # --- Main Scan Logic (Modified by athxsec) ---
 
 async def run_scan(args):
     """ The main scanning workflow """
-    if len(sys.argv) > 1: print_banners() # Print banner only in CLI mode
+    if len(sys.argv) > 1: print_banners()
     console.print(f"[bold]Target Domain:[/bold] {args.domain}\n")
 
     # --- Step 0: Wildcard Check ---
-    if not args.no_wildcard:
-        is_wildcard = await check_wildcard(args.domain)
-        # We don't stop on wildcard, just warn, but could add option later
+    if not args.no_wildcard: await check_wildcard(args.domain)
 
-    # --- Step 1: Gather Initial Subdomains (Passive/Active) ---
+    # --- Step 1: Gather Initial Subdomains ---
     found_passive_subs = set()
     found_active_subs = set()
-    initial_subdomains = set() # Combined results from passive/active
+    initial_subdomains = set()
 
-    passive_connector = aiohttp.TCPConnector(resolver=aiohttp.AsyncResolver(nameservers=RESOLVERS))
+    # Shared connector and session for passive/wayback
+    passive_resolver = aiohttp.AsyncResolver(nameservers=RESOLVERS)
+    passive_connector = aiohttp.TCPConnector(resolver=passive_resolver)
     headers = {'User-Agent': USER_AGENT}
 
     if not args.no_passive:
@@ -494,118 +421,116 @@ async def run_scan(args):
         console.print(f"[+] Passive scans complete. Found {len(found_passive_subs)} potential subdomains.", style="green")
 
     if not args.no_active and args.wordlist:
+        # Note: active_scan modifies results_data directly now
         await active_scan(args.domain, args.wordlist, args.threads, found_active_subs)
         initial_subdomains.update(found_active_subs)
-        console.print(f"[+] Active scan complete. Found {len(found_active_subs)} additional potential subdomains.", style="green")
+        console.print(f"[+] Active scan complete. Added {len(found_active_subs)} potential subdomains.", style="green")
 
     if not initial_subdomains:
-        console.print("[yellow]No potential subdomains found from passive/active scans.[/]")
-        return
-
+        console.print("[yellow]No potential subdomains found.[/]"); return
     console.print(f"\n[*] Total potential subdomains found: {len(initial_subdomains)}")
 
-    # --- Step 2: Resolve & CNAME Check (if requested) ---
-    domains_to_process = initial_subdomains
-    if args.resolve or args.probe or args.cname or args.wayback: # If any downstream step needs live domains
+    # --- Step 2: Resolve & CNAME Check ---
+    # Resolve ALL initial subdomains if any downstream task needs live ones
+    domains_to_process_further = initial_subdomains
+    if args.resolve or args.probe or args.cname or args.wayback:
         console.print(f"[*] Resolving {len(initial_subdomains)} potential subdomains (threads: {args.threads})...", style="yellow")
+        # Run resolver, results go into global results_data
         await run_resolver_engine(initial_subdomains, args.threads, args.cname)
-        # Filter results_data to only include those that were successfully resolved (have IPs or CNAMEs)
-        resolved_domains = set(results_data.keys())
+        resolved_domains = set(results_data.keys()) # Domains that had an A or CNAME record
         console.print(f"[+] Resolution complete. Found {len(resolved_domains)} live subdomains.", style="green")
-        domains_to_process = resolved_domains # Use only resolved domains for next steps
+        domains_to_process_further = resolved_domains
     else:
-        # If not resolving, just populate results_data with the initial finds for basic output
-        for sub in initial_subdomains:
-             results_data[sub] = {} # Empty dict, no extra info known
+        # Populate results_data minimally if not resolving
+        for sub in initial_subdomains: results_data[sub] = {}
 
-    if not domains_to_process:
-        console.print("[yellow]No live subdomains found after resolution.[/]")
-        return
+    if not domains_to_process_further:
+        console.print("[yellow]No live subdomains found after resolution.[/]"); return
 
-    # --- Step 3: HTTP/HTTPS Probing (if requested) ---
+    # --- Step 3: HTTP/HTTPS Probing ---
+    domains_for_wayback = set()
     if args.probe:
-        console.print(f"\n[*] Probing {len(domains_to_process)} live subdomains for web servers (concurrency: {args.probe_concurrency})...", style="yellow")
-        await run_probing_engine(domains_to_process, args.probe_concurrency)
+        console.print(f"\n[*] Probing {len(domains_to_process_further)} live subdomains for web servers (concurrency: {args.probe_concurrency})...", style="yellow")
+        await run_probing_engine(domains_to_process_further, args.probe_concurrency)
         probed_count = sum(1 for data in results_data.values() if data.get("http_urls"))
         console.print(f"[+] Probing complete. Found {probed_count} web servers.", style="green")
-        # For Wayback, only query domains that showed a web server
-        if args.wayback:
-            domains_to_process = {sub for sub, data in results_data.items() if data.get("http_urls")}
+        domains_for_wayback = {sub for sub, data in results_data.items() if data.get("http_urls")}
+    elif args.wayback: # If wayback is needed but probe isn't, assume all resolved domains might have web history
+        domains_for_wayback = domains_to_process_further
 
-
-    # --- Step 4: Wayback Machine Query (if requested) ---
-    if args.wayback and domains_to_process:
-         console.print(f"\n[*] Querying Wayback Machine for {len(domains_to_process)} web domains (concurrency: {args.concurrency})...", style="yellow")
-         semaphore = asyncio.Semaphore(args.concurrency) # Reuse passive concurrency limit
-         async with aiohttp.ClientSession(headers=headers, connector=passive_connector) as session: # Reuse connector
-             wayback_tasks = [source_wayback(sub, session, semaphore) for sub in domains_to_process]
+    # --- Step 4: Wayback Machine Query ---
+    if args.wayback and domains_for_wayback:
+         console.print(f"\n[*] Querying Wayback Machine for {len(domains_for_wayback)} web domains (concurrency: {args.concurrency})...", style="yellow")
+         semaphore = asyncio.Semaphore(args.concurrency)
+         # Need a NEW session here as the previous one might be closed
+         async with aiohttp.ClientSession(headers=headers, connector=passive_connector) as wayback_session:
+             wayback_tasks = [source_wayback(sub, wayback_session, semaphore) for sub in domains_for_wayback]
              await asyncio.gather(*wayback_tasks)
          console.print("[+] Wayback queries complete.", style="green")
 
-
     # --- Step 5: Final Output ---
-    final_domains_list = sorted(list(results_data.keys()))
-    live_count = len([d for d, data in results_data.items() if data.get("ips") or data.get("cnames")])
+    final_live_domains = sorted(results_data.keys()) # All domains we have *any* data for (IPs, CNAMEs, etc.)
+    live_count = len(final_live_domains)
 
     console.print(f"\n[+] [bold]Scan Complete![/]", style="green")
     if args.resolve or args.probe or args.cname or args.wayback:
-         console.print(f"    [bold]└─ Processed {len(initial_subdomains)} initial candidates -> Found {live_count} live subdomains.[/]", style="bold green")
+        console.print(f"    [bold]└─ Found {live_count} live subdomains with details.[/]", style="bold green")
+    else:
+        console.print(f"    [bold]└─ Found {len(initial_subdomains)} potential subdomains (run with -r to resolve).[/]", style="bold green")
 
-    # Determine what to actually output/save
-    output_list = final_domains_list
-    if args.resolve: # If resolve flag is set, only output domains we confirmed live
-        output_list = sorted([domain for domain in final_domains_list if results_data[domain].get("ips") or results_data[domain].get("cnames")])
+
+    output_list = []
+    if args.resolve: # If resolve flag is set, output only domains we confirmed live
+        output_list = final_live_domains
+    else: # Otherwise, output all initially found domains (no extra details)
+        output_list = sorted(list(initial_subdomains))
 
     if args.output:
         console.print(f"[*] Saving {len(output_list)} results to [bold]{args.output}[/] (format: {args.output_format})...", style="yellow")
         try:
             with open(args.output, 'w') as f:
                 if args.output_format == 'json':
-                    # Create a filtered dict for JSON output
                     output_json_data = {domain: results_data[domain] for domain in output_list if domain in results_data}
                     json.dump(output_json_data, f, indent=4)
-                else: # Default to TXT
-                    for domain in output_list:
-                        f.write(domain + '\n')
+                else:
+                    for domain in output_list: f.write(domain + '\n')
             console.print("[+] Results saved.", style="green")
-        except IOError as e:
-            console.print(f"[-] Failed to write to file: {e}", style="red")
+        except IOError as e: console.print(f"[-] Failed to write to file: {e}", style="red")
     else:
         # Print detailed results to console if not saving to file
         console.print(f"\n--- [bold]Results[/] ({len(output_list)}) ---", style="cyan")
-        if not output_list:
-             console.print("[yellow]No results to display based on filters.[/]")
+        if not output_list: console.print("[yellow]No results to display based on filters.[/]")
         else:
             for domain in output_list:
-                 print_result(domain, results_data.get(domain, {}), args)
+                # If resolving/probing, print details, otherwise just print the name
+                if args.resolve or args.probe or args.cname or args.wayback:
+                    print_result(domain, results_data.get(domain, {}), args)
+                else:
+                     console.print(f"[bold green]{domain}[/]", highlight=False)
+
+    # Close the shared connector explicitly
+    await passive_connector.close()
 
 
 # --- Main Entry Point ---
 def main():
     """ Main entry point """
     try:
-        if len(sys.argv) > 1:
-            args = get_cli_args()
-        else:
-            args = get_interactive_args()
+        if len(sys.argv) > 1: args = get_cli_args()
+        else: args = get_interactive_args()
 
-        if not args.domain:
-             console.print("[-] [red]Error: Target domain required.[/]", style="red"); sys.exit(1)
+        if not args.domain: console.print("[-] [red]Error: Target domain required.[/]", style="red"); sys.exit(1)
         if args.no_passive and (args.no_active or not args.wordlist):
              console.print("[-] [red]Error: Must enable passive or provide wordlist for active scan.[/]", style="red"); sys.exit(1)
-        # If probing/wayback/CNAME is requested, resolve must implicitly happen
-        if args.probe or args.cname or args.wayback:
-            args.resolve = True
+        # Force resolve if any detail-oriented flags are set
+        if args.probe or args.cname or args.wayback: args.resolve = True
 
         asyncio.run(run_scan(args))
 
-    except KeyboardInterrupt:
-        console.print("\n[!] Scan interrupted by user.", style="red"); sys.exit(0)
+    except KeyboardInterrupt: console.print("\n[!] Scan interrupted by user.", style="red"); sys.exit(0)
     except Exception as e:
          console.print(f"\n[!] [bold red]An unexpected error occurred:[/]", style="red")
-         console.print_exception(show_locals=False) # Print traceback
-         sys.exit(1)
-
+         console.print_exception(show_locals=False); sys.exit(1)
 
 if __name__ == "__main__":
     main()
